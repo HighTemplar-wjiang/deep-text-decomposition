@@ -1,13 +1,21 @@
+import glob
+
 import numpy as np
 import matplotlib.pyplot as plt
 import cv2
 import time
 import copy
 import os
+os.environ["PATH"] += os.pathsep + 'C:/Program Files/Graphviz/bin'
+
+from pathlib import Path
 
 import utils
 import loss
 import cyclegan_networks as cycnet
+
+import wandb
+from torch.utils.tensorboard import SummaryWriter
 
 import torch
 torch.cuda.current_device()
@@ -16,14 +24,22 @@ import torch.optim as optim
 from torch.optim import lr_scheduler
 import torch.nn as nn
 
+from torchvision import transforms
+import torchvision.transforms.functional as TF
 
 # Decide which device we want to run on
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# Debug flags
+use_wandb = False
+use_tensorboard = True
 
 
 class UnmixGAN():
 
     def __init__(self, args, dataloaders):
+
+        self.args = args
 
         self.dataloaders = dataloaders
         self.net_D1 = cycnet.define_D(input_nc=6, ndf=64, netD='n_layers', n_layers_D=2).to(device)
@@ -33,26 +49,27 @@ class UnmixGAN():
             input_nc=3, output_nc=6, ngf=args.ngf, netG=args.net_G, use_dropout=False, norm='none').to(device)
 
         # Learning rate and Beta1 for Adam optimizers
+        self.is_lr_scheduler_enabled = args.enable_lr_scheduler
         self.lr = args.lr
 
         # define optimizers
-        self.optimizer_G = optim.Adam(
+        self.optimizer_G = optim.AdamW(
             self.net_G.parameters(), lr=self.lr, betas=(0.5, 0.999))
-        self.optimizer_D1 = optim.Adam(
+        self.optimizer_D1 = optim.AdamW(
             self.net_D1.parameters(), lr=self.lr, betas=(0.5, 0.999))
-        self.optimizer_D2 = optim.Adam(
+        self.optimizer_D2 = optim.AdamW(
             self.net_D2.parameters(), lr=self.lr, betas=(0.5, 0.999))
-        self.optimizer_D3 = optim.Adam(
+        self.optimizer_D3 = optim.AdamW(
             self.net_D3.parameters(), lr=self.lr, betas=(0.5, 0.999))
 
         # define lr schedulers
-        self.exp_lr_scheduler_G = lr_scheduler.StepLR(
+        self.lr_scheduler_G = lr_scheduler.StepLR(
             self.optimizer_G, step_size=args.exp_lr_scheduler_stepsize, gamma=0.1)
-        self.exp_lr_scheduler_D1 = lr_scheduler.StepLR(
+        self.lr_scheduler_D1 = lr_scheduler.StepLR(
             self.optimizer_D1, step_size=args.exp_lr_scheduler_stepsize, gamma=0.1)
-        self.exp_lr_scheduler_D2 = lr_scheduler.StepLR(
+        self.lr_scheduler_D2 = lr_scheduler.StepLR(
             self.optimizer_D2, step_size=args.exp_lr_scheduler_stepsize, gamma=0.1)
-        self.exp_lr_scheduler_D3 = lr_scheduler.StepLR(
+        self.lr_scheduler_D3 = lr_scheduler.StepLR(
             self.optimizer_D3, step_size=args.exp_lr_scheduler_stepsize, gamma=0.1)
 
         # coefficient to balance loss functions
@@ -65,7 +82,7 @@ class UnmixGAN():
         # define some other vars to record the training states
         self.running_acc = []
         self.epoch_acc = 0
-        if 'mse' in self.metric:
+        if 'mse' in self.metric or 'dice_loss' in self.metric:
             self.best_val_acc = 1e9  # for mse, rmse, a lower score is better
         else:
             self.best_val_acc = 0.0  # for others (ssim, psnr), a higher score is better
@@ -88,9 +105,13 @@ class UnmixGAN():
 
         # define the loss functions
         if args.pixel_loss == 'minimum_pixel_loss':
-            self._pxl_loss = loss.MinimumPixelLoss(opt=1) # 1 for L1 and 2 for L2
+            self._pxl_loss = loss.MinimumPixelLoss(opt=1)  # 1 for L1 and 2 for L2
         elif args.pixel_loss == 'pixel_loss':
             self._pxl_loss = loss.PixelLoss(opt=1)  # 1 for L1 and 2 for L2
+        elif args.pixel_loss == "minimum_dice_loss":
+            self._pxl_loss = loss.MinimumDiceLoss()
+        elif args.pixel_loss == "dice_loss":
+            self._pxl_loss = loss.DiceLoss()
         else:
             raise NotImplementedError('pixel loss function [%s] is not implemented', args.pixel_loss)
         self._gan_loss = loss.GANLoss(gan_mode='vanilla').to(device)
@@ -121,6 +142,57 @@ class UnmixGAN():
         if args.print_models:
             self._visualize_models()
 
+        self.tb_writer = None
+
+    def test_image(self, test_path):
+        print('testing actual images...')
+
+        test_images = glob.glob(os.path.join(test_path, "*.bmp"))
+
+        # Pad to square.
+        square_transform = transforms.Compose([
+            # utils.SquarePad(),
+            # transforms.Resize([int(self.args.in_size / 2), int(self.args.in_size / 2)]),
+            # transforms.CenterCrop([int(self.args.in_size / 2), int(self.args.in_size / 2)])
+            utils.CenterPad([self.args.in_size, self.args.in_size], downsample_ratio=0.27)
+        ])
+
+        test_input_batch = []
+        for test_image in test_images:
+
+            # Read image.
+            img_mix = cv2.imread(test_image, cv2.IMREAD_COLOR)
+            img_mix = cv2.cvtColor(img_mix, cv2.COLOR_BGR2RGB)
+            # img_mix = TF.resize(TF.to_pil_image(img_mix), [self.args.in_size, self.args.in_size])
+            img_mix = TF.to_tensor(img_mix)
+            img_mix = square_transform(img_mix)
+            test_input_batch.append(img_mix)
+
+        test_input_batch = torch.stack(test_input_batch)
+
+        # Forward network for prediction.
+        with torch.no_grad():
+            out = self.net_G(test_input_batch.to(device))
+            test_pred1 = out[:, 0:3, :, :]
+            test_pred2 = out[:, 3:6, :, :]
+
+        # Slicing for predictions.
+        # G_pred1 = np.array(G_pred1.cpu().detach())
+        # G_pred1 = G_pred1[0, :].transpose([1, 2, 0])
+        # G_pred2 = np.array(G_pred2.cpu().detach())
+        # G_pred2 = G_pred2[0, :].transpose([1, 2, 0])
+        # img_mix = np.array(img_mix.cpu().detach())
+        # img_mix = img_mix[0, :].transpose([1, 2, 0])
+
+        vis_input = utils.make_numpy_grid(test_input_batch)
+        vis_pred1 = utils.make_numpy_grid(test_pred1)
+        vis_pred2 = utils.make_numpy_grid(test_pred2)
+        vis = np.concatenate([vis_input, vis_pred1, vis_pred2], axis=0)
+        vis = np.clip(vis, a_min=0.0, a_max=1.0)
+        file_name = os.path.join(
+            self.args.output_dir, Path(test_path).stem + '_' +
+                          str(self.epoch_id) + '_' + str(self.batch_id) + '.jpg')
+        plt.imsave(file_name, vis)
 
     def _visualize_models(self):
 
@@ -140,7 +212,6 @@ class UnmixGAN():
         mygraph = make_dot(y.mean(), params=dict(self.net_D3.named_parameters()))
         mygraph.render('D3')
 
-
     def _load_checkpoint(self):
 
         if os.path.exists(os.path.join(self.checkpoint_dir, 'last_ckpt.pt')):
@@ -151,28 +222,28 @@ class UnmixGAN():
             # update net_G states
             self.net_G.load_state_dict(checkpoint['model_G_state_dict'])
             self.optimizer_G.load_state_dict(checkpoint['optimizer_G_state_dict'])
-            self.exp_lr_scheduler_G.load_state_dict(
+            self.lr_scheduler_G.load_state_dict(
                 checkpoint['exp_lr_scheduler_G_state_dict'])
             self.net_G.to(device)
 
             # update net_D1 states
             self.net_D1.load_state_dict(checkpoint['model_D1_state_dict'])
             self.optimizer_D1.load_state_dict(checkpoint['optimizer_D1_state_dict'])
-            self.exp_lr_scheduler_D1.load_state_dict(
+            self.lr_scheduler_D1.load_state_dict(
                 checkpoint['exp_lr_scheduler_D1_state_dict'])
             self.net_D1.to(device)
 
             # update net_D2 states
             self.net_D2.load_state_dict(checkpoint['model_D2_state_dict'])
             self.optimizer_D2.load_state_dict(checkpoint['optimizer_D2_state_dict'])
-            self.exp_lr_scheduler_D2.load_state_dict(
+            self.lr_scheduler_D2.load_state_dict(
                 checkpoint['exp_lr_scheduler_D2_state_dict'])
             self.net_D2.to(device)
 
             # update net_D3 states
             self.net_D3.load_state_dict(checkpoint['model_D3_state_dict'])
             self.optimizer_D3.load_state_dict(checkpoint['optimizer_D3_state_dict'])
-            self.exp_lr_scheduler_D3.load_state_dict(
+            self.lr_scheduler_D3.load_state_dict(
                 checkpoint['exp_lr_scheduler_D3_state_dict'])
             self.net_D3.to(device)
 
@@ -188,7 +259,6 @@ class UnmixGAN():
         else:
             print('training from scratch...')
 
-
     def _save_checkpoint(self, ckpt_name):
         torch.save({
             'epoch_id': self.epoch_id,
@@ -196,25 +266,23 @@ class UnmixGAN():
             'best_epoch_id': self.best_epoch_id,
             'model_G_state_dict': self.net_G.state_dict(),
             'optimizer_G_state_dict': self.optimizer_G.state_dict(),
-            'exp_lr_scheduler_G_state_dict': self.exp_lr_scheduler_G.state_dict(),
+            'exp_lr_scheduler_G_state_dict': self.lr_scheduler_G.state_dict(),
             'model_D1_state_dict': self.net_D1.state_dict(),
             'optimizer_D1_state_dict': self.optimizer_D1.state_dict(),
-            'exp_lr_scheduler_D1_state_dict': self.exp_lr_scheduler_D1.state_dict(),
+            'exp_lr_scheduler_D1_state_dict': self.lr_scheduler_D1.state_dict(),
             'model_D2_state_dict': self.net_D2.state_dict(),
             'optimizer_D2_state_dict': self.optimizer_D2.state_dict(),
-            'exp_lr_scheduler_D2_state_dict': self.exp_lr_scheduler_D2.state_dict(),
+            'exp_lr_scheduler_D2_state_dict': self.lr_scheduler_D2.state_dict(),
             'model_D3_state_dict': self.net_D3.state_dict(),
             'optimizer_D3_state_dict': self.optimizer_D3.state_dict(),
-            'exp_lr_scheduler_D3_state_dict': self.exp_lr_scheduler_D3.state_dict()
+            'exp_lr_scheduler_D3_state_dict': self.lr_scheduler_D3.state_dict()
         }, os.path.join(self.checkpoint_dir, ckpt_name))
 
-
     def _update_lr_schedulers(self):
-        self.exp_lr_scheduler_G.step()
-        self.exp_lr_scheduler_D1.step()
-        self.exp_lr_scheduler_D2.step()
-        self.exp_lr_scheduler_D3.step()
-
+        self.lr_scheduler_G.step()
+        self.lr_scheduler_D1.step()
+        self.lr_scheduler_D2.step()
+        self.lr_scheduler_D3.step()
 
     def _compute_acc(self):
 
@@ -224,19 +292,20 @@ class UnmixGAN():
         img2 = self.G_pred2.detach()
 
         if self.metric == 'psnr':
-            acc1 = 0.5*utils.cpt_psnr(img1, target1, PIXEL_MAX=1.0) + \
-                   0.5*utils.cpt_psnr(img2, target2, PIXEL_MAX=1.0)
-            acc2 = 0.5*utils.cpt_psnr(img1, target2, PIXEL_MAX=1.0) + \
-                   0.5*utils.cpt_psnr(img2, target1, PIXEL_MAX=1.0)
+            acc1 = 0.5 * utils.cpt_psnr(img1, target1, PIXEL_MAX=1.0) + \
+                   0.5 * utils.cpt_psnr(img2, target2, PIXEL_MAX=1.0)
+            acc2 = 0.5 * utils.cpt_psnr(img1, target2, PIXEL_MAX=1.0) + \
+                   0.5 * utils.cpt_psnr(img2, target1, PIXEL_MAX=1.0)
+            # acc2 = -100
             return max(acc1, acc2)
         elif self.metric == 'psnr_gt1':
             acc = utils.cpt_psnr(img1, target1, PIXEL_MAX=1.0)
             return acc
         elif self.metric == 'ssim':
-            acc1 = 0.5*utils.cpt_ssim(img1, target1) + \
-                   0.5*utils.cpt_ssim(img2, target2)
-            acc2 = 0.5*utils.cpt_ssim(img1, target2) + \
-                   0.5*utils.cpt_ssim(img2, target1)
+            acc1 = 0.5 * utils.cpt_ssim(img1, target1) + \
+                   0.5 * utils.cpt_ssim(img2, target2)
+            acc2 = 0.5 * utils.cpt_ssim(img1, target2) + \
+                   0.5 * utils.cpt_ssim(img2, target1)
             return max(acc1, acc2)
         elif self.metric == 'ssim_gt1':
             acc = utils.cpt_ssim(img1, target1)
@@ -247,8 +316,6 @@ class UnmixGAN():
         else:
             raise NotImplementedError('metric method [%s] is not implemented' % self.metric)
 
-
-
     def _collect_running_batch_states(self):
         self.running_acc.append(self._compute_acc().item())
 
@@ -256,35 +323,55 @@ class UnmixGAN():
         if self.is_training is False:
             m = len(self.dataloaders['val'])
 
-        if np.mod(self.batch_id, 100) == 1 or self.batch_id == m-1:
+        if np.mod(self.batch_id, 100) == 1 or self.batch_id == m - 1:
             print('Is_training: %s. [%d,%d][%d,%d], G_loss: %.8f, D_loss: %.8f, running_acc: %.8f (%s),'
-                  % (self.is_training, self.epoch_id, self.max_num_epochs-1, self.batch_id, m,
+                  % (self.is_training, self.epoch_id, self.max_num_epochs - 1, self.batch_id, m,
                      self.G_loss.item(), self.D_loss.item(),
                      np.mean(self.running_acc), self.metric))
 
-        if np.mod(self.batch_id, 1000) == 1 or self.batch_id == m-1:
+        # Log loss for each batch.
+        if use_wandb and self.is_training:
+            wandb.log({"D_loss (train)": self.D_loss.item(),
+                       "G_loss (train)": self.G_loss.item(),
+                       "Acc (train)": np.mean(self.running_acc)})
+
+        if use_tensorboard and self.is_training:
+            num_iteration = self.epoch_id * m + self.batch_id
+            self.tb_writer.add_scalar("Loss_G/train", self.G_loss.item(), num_iteration)
+            self.tb_writer.add_scalar("Loss_D/train", self.D_loss.item(), num_iteration)
+            self.tb_writer.add_scalar("Acc/train", np.mean(self.running_acc), num_iteration)
+
+        if np.mod(self.batch_id, 100) == 1 or self.batch_id == m - 1:
             vis_input = utils.make_numpy_grid(self.batch['input'])
             vis_pred1 = utils.make_numpy_grid(self.G_pred1)
             vis_pred2 = utils.make_numpy_grid(self.G_pred2)
             if self.output_auto_enhance:
-                vis_pred1 = vis_pred1*1.5
-                vis_pred2 = vis_pred2*1.5
+                vis_pred1 = vis_pred1 * 1.5
+                vis_pred2 = vis_pred2 * 1.5
             vis = np.concatenate([vis_input, vis_pred1, vis_pred2], axis=0)
             vis = np.clip(vis, a_min=0.0, a_max=1.0)
             file_name = os.path.join(
-                self.vis_dir, 'istrain_'+str(self.is_training)+'_'+
-                              str(self.epoch_id)+'_'+str(self.batch_id)+'.jpg')
+                self.vis_dir, 'istrain_' + str(self.is_training) + '_' +
+                              str(self.epoch_id) + '_' + str(self.batch_id) + '.jpg')
             plt.imsave(file_name, vis)
 
-
+            # Testing actual images.
+            self.test_image(self.args.test_dir)
 
     def _collect_epoch_states(self):
 
         self.epoch_acc = np.mean(self.running_acc)
         print('Is_training: %s. Epoch %d / %d, epoch_acc= %.8f (%s),' %
-              (self.is_training, self.epoch_id, self.max_num_epochs-1, self.epoch_acc, self.metric))
+              (self.is_training, self.epoch_id, self.max_num_epochs - 1, self.epoch_acc, self.metric))
         print()
 
+        # Log epoch states..
+        if use_wandb:
+            wandb.log({f"Acc (test, {self.metric:s})": self.epoch_acc})
+
+        if use_tensorboard and self.tb_writer:
+            if not self.is_training:
+                self.tb_writer.add_scalar("Acc/test", self.epoch_acc, self.epoch_id)
 
     def _update_checkpoints(self):
 
@@ -293,6 +380,10 @@ class UnmixGAN():
         print('Lastest model updated. Epoch_acc=%.4f, Historical_best_acc=%.4f (at epoch %d)'
               % (self.epoch_acc, self.best_val_acc, self.best_epoch_id))
         print()
+
+        # save model every 100 epochs
+        if (self.epoch_id+1) % 100 == 0:
+            self._save_checkpoint(ckpt_name=f'ckpt_{self.epoch_id:04d}.pt')
 
         # update the best model (based on eval acc)
         if self.metric == 'labrmse_gt1':
@@ -313,19 +404,17 @@ class UnmixGAN():
                 print()
         # update the best model (based on eval acc)
 
-
-
     def _clear_cache(self):
         self.running_acc = []
-
 
     def _forward_pass(self, batch):
         self.batch = batch
         img_in = batch['input'].to(device)
         y = self.net_G(img_in)
+
+        # Get generated images.
         self.G_pred1 = y[:, 0:3, :, :]
         self.G_pred2 = y[:, 3:, :, :]
-
 
     def _backward_D(self):
 
@@ -345,7 +434,7 @@ class UnmixGAN():
                 D1_pred_real = self.net_D1(real_cat)
                 D1_adv_loss_fake = self._gan_loss(D1_pred_fake, False)
                 D1_adv_loss_real = self._gan_loss(D1_pred_real, True)
-                D1_adv_loss = 0.5*(D1_adv_loss_fake + D1_adv_loss_real)
+                D1_adv_loss = 0.5 * (D1_adv_loss_fake + D1_adv_loss_real)
 
                 # D2
                 fake_cat = torch.cat((img_in, self.G_pred2), dim=1).detach()
@@ -355,7 +444,7 @@ class UnmixGAN():
                 D2_pred_real = self.net_D2(real_cat)
                 D2_adv_loss_fake = self._gan_loss(D2_pred_fake, False)
                 D2_adv_loss_real = self._gan_loss(D2_pred_real, True)
-                D2_adv_loss = 0.5*(D2_adv_loss_fake + D2_adv_loss_real)
+                D2_adv_loss = 0.5 * (D2_adv_loss_fake + D2_adv_loss_real)
 
                 self.D_loss += self.lambda_adv * (D1_adv_loss + D2_adv_loss)
 
@@ -375,10 +464,9 @@ class UnmixGAN():
                 D3_adv_loss_real = self._gan_loss(D3_pred_real, True)
                 D3_adv_loss = 0.5 * (D3_adv_loss_fake + D3_adv_loss_real)
 
-                self.D_loss += self.lambda_adv*D3_adv_loss
+                self.D_loss += self.lambda_adv * D3_adv_loss
 
         self.D_loss.backward()
-
 
     def _backward_G(self):
 
@@ -405,7 +493,7 @@ class UnmixGAN():
                 fake_cat = torch.cat((img_in, self.G_pred2), dim=1)
                 D2_pred_fake = self.net_D2(fake_cat)
                 G_adv_loss += self._gan_loss(D1_pred_fake, True) + \
-                             self._gan_loss(D2_pred_fake, True)
+                              self._gan_loss(D2_pred_fake, True)
 
             if self.with_d3:
                 fake_cat = torch.cat((self.G_pred1, self.G_pred2), dim=1)
@@ -415,23 +503,37 @@ class UnmixGAN():
                 D3_pred_fake = self.net_D3(fake_cat)
                 G_adv_loss += self._gan_loss(D3_pred_fake, True)
 
-        self.G_loss = self.lambda_L1*pixel_loss + \
-                      self.lambda_adv*G_adv_loss + \
-                      2*exclusion_loss + \
+        self.G_loss = self.lambda_L1 * pixel_loss + \
+                      self.lambda_adv * G_adv_loss + \
+                      2 * exclusion_loss + \
                       kurtosis_loss
         self.G_loss.backward()
 
+    def train_models(self, from_scratch=False):
 
+        # Training logger.
+        if use_wandb:
+            wandb.init(project="image-decomposition",
+                       entity="jaist-matlab",
+                       config={"epochs": self.max_num_epochs,
+                               "batch_size": self.dataloaders['train'].batch_size})
+            # wandb.watch(self.net_G, log_freq=100)
+            # wandb.watch(self.net_D1, log_freq=100)
+            # wandb.watch(self.net_D2, log_freq=100)
+            # wandb.watch(self.net_D3, log_freq=100)
 
-    def train_models(self):
+        if use_tensorboard:
+            self.tb_writer = SummaryWriter()
 
-        self._load_checkpoint()
+        if not from_scratch:
+            self._load_checkpoint()
 
         # loop over the dataset multiple times
         for self.epoch_id in range(self.epoch_to_start, self.max_num_epochs):
 
             ################## train #################
             ##########################################
+            print("Starting epoch {:d} / {:d}, lr = {:f}".format(self.epoch_id, self.max_num_epochs, self.lr_scheduler_G.get_last_lr()[0]))
             self._clear_cache()
             self.is_training = True
             self.net_G.train()  # Set model to training mode
@@ -461,7 +563,8 @@ class UnmixGAN():
                 self.optimizer_G.step()
                 self._collect_running_batch_states()
             self._collect_epoch_states()
-            self._update_lr_schedulers()
+            if self.is_lr_scheduler_enabled:
+                self._update_lr_schedulers()
 
             ################## Eval ##################
             ##########################################
@@ -485,6 +588,7 @@ class UnmixGAN():
             ##########################################
             self._update_checkpoints()
 
-
-
-
+        # Training finished.
+        if use_tensorboard and self.tb_writer:
+            self.tb_writer.close()
+            self.tb_writer = None

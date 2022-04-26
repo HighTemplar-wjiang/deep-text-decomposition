@@ -1,0 +1,14 @@
+# Ignore saved models. 
+src/checkpoints
+
+# Ignore images.
+src/train_data
+src/test_data
+src/eval_output
+src/val_out
+*.jpg
+*.bmp
+*.png
+
+# Tensorboard
+runs
